@@ -5,7 +5,7 @@ use pinocchio::{
 };
 use pinocchio_system::create_account_with_minimum_balance_signed;
 use pinocchio_token::{
-    instructions::{InitializeAccount3, Transfer},
+    instructions::{CloseAccount, InitializeAccount3, Transfer},
     state::Account as TokenAccount,
 };
 
@@ -179,4 +179,54 @@ pub fn withdraw(program_id: &Address, accounts: &mut [AccountView], data: &[u8])
     ];
     Transfer::new(vault, destination, jar, amount)
         .invoke_signed_with_program(&[Signer::from(&seeds)], token_program.address())
+}
+
+/// Accounts: owner (signer, writable), jar (writable), vault (writable),
+/// token program. No data. Closes the vault and the jar; rent goes to owner.
+pub fn close_jar(program_id: &Address, accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
+    let [owner, jar, vault, token_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !owner.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    check_token_program(token_program)?;
+
+    let jar_state = Jar::load(jar, program_id)?;
+    if owner.address() != &jar_state.owner {
+        return Err(TipJarError::Unauthorized.into());
+    }
+    if vault.address() != &jar_state.vault {
+        return Err(ProgramError::InvalidArgument);
+    }
+    {
+        if !vault.owned_by(&pinocchio_token::ID) {
+            return Err(ProgramError::InvalidAccountOwner);
+        }
+        let vault_state = TokenAccount::from_account_view(vault)?;
+        if vault_state.amount() != 0 {
+            return Err(TipJarError::VaultNotEmpty.into());
+        }
+    }
+
+    let bump_seed = [jar_state.bump];
+    let seeds = [
+        Seed::from(JAR_SEED),
+        Seed::from(jar_state.owner.as_array()),
+        Seed::from(jar_state.mint.as_array()),
+        Seed::from(&bump_seed),
+    ];
+    CloseAccount::new(vault, owner, jar)
+        .invoke_signed_with_program(&[Signer::from(&seeds)], token_program.address())?;
+
+    let new_owner_lamports = owner
+        .lamports()
+        .checked_add(jar.lamports())
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    owner.set_lamports(new_owner_lamports);
+    jar.close()
 }

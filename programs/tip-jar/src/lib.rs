@@ -25,6 +25,7 @@ mod entrypoint {
             0 => instructions::initialize(program_id, accounts, data),
             1 => instructions::tip(program_id, accounts, data),
             2 => instructions::withdraw(program_id, accounts, data),
+            3 => instructions::close_jar(program_id, accounts, data),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -34,6 +35,7 @@ mod entrypoint {
 pub enum TipJarError {
     ZeroAmount = 0,
     Unauthorized = 1,
+    VaultNotEmpty = 2,
 }
 
 impl From<TipJarError> for ProgramError {

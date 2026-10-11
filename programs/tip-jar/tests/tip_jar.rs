@@ -13,9 +13,11 @@ const SYSTEM_PROGRAM: Pubkey = Pubkey::new_from_array([0; 32]);
 const IX_INITIALIZE: u8 = 0;
 const IX_TIP: u8 = 1;
 const IX_WITHDRAW: u8 = 2;
+const IX_CLOSE_JAR: u8 = 3;
 
 const ERR_ZERO_AMOUNT: &str = "Custom(0)";
 const ERR_UNAUTHORIZED: &str = "Custom(1)";
+const ERR_VAULT_NOT_EMPTY: &str = "Custom(2)";
 const ERR_INSUFFICIENT_FUNDS: &str = "InsufficientFunds";
 
 const MINTED: u64 = 1_000;
@@ -147,6 +149,24 @@ impl Ctx {
         self.send(ix, &[signer])
     }
 
+    fn close_jar(&mut self, signer: &Keypair, owner: Pubkey) -> Result<(), String> {
+        let ix = Instruction::new_with_bytes(
+            self.program_id,
+            &[IX_CLOSE_JAR],
+            vec![
+                AccountMeta::new(owner, signer.pubkey() == owner),
+                AccountMeta::new(self.jar, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM, false),
+            ],
+        );
+        self.send(ix, &[signer])
+    }
+
+    fn lamports(&self, account: &Pubkey) -> u64 {
+        self.svm.get_account(account).map_or(0, |a| a.lamports)
+    }
+
     fn token_balance(&self, account: &Pubkey) -> u64 {
         let data = self.svm.get_account(account).unwrap().data;
         u64::from_le_bytes(data[64..72].try_into().unwrap())
@@ -248,4 +268,68 @@ fn tip_to_wrong_vault_fails() {
     ctx.vault = ctx.owner_ata;
     assert!(ctx.tip(10).is_err());
     assert_eq!(ctx.token_balance(&ctx.owner_ata), 0);
+}
+
+#[test]
+fn owner_closes_empty_jar() {
+    let mut ctx = setup();
+    ctx.initialize().unwrap();
+    ctx.tip(500).unwrap();
+    let owner = ctx.owner.insecure_clone();
+    let owner_ata = ctx.owner_ata;
+    ctx.withdraw(&owner, owner_ata, 500).unwrap();
+
+    let owner_key = owner.pubkey();
+    let rent = ctx.lamports(&ctx.jar) + ctx.lamports(&ctx.vault);
+    assert!(rent > 0);
+    let owner_before = ctx.lamports(&owner_key);
+
+    ctx.close_jar(&owner, owner_key).unwrap();
+
+    assert_eq!(ctx.lamports(&ctx.jar), 0);
+    assert_eq!(ctx.lamports(&ctx.vault), 0);
+    assert!(ctx.svm.get_account(&ctx.jar).is_none());
+    assert!(ctx.svm.get_account(&ctx.vault).is_none());
+    // Owner pays the 5000 lamport fee as the transaction fee payer.
+    assert_eq!(ctx.lamports(&owner_key), owner_before + rent - 5_000);
+
+    // The jar can be created again after closing.
+    ctx.initialize().unwrap();
+}
+
+#[test]
+fn close_jar_with_tokens_fails() {
+    let mut ctx = setup();
+    ctx.initialize().unwrap();
+    ctx.tip(500).unwrap();
+
+    let owner = ctx.owner.insecure_clone();
+    let owner_key = owner.pubkey();
+    let err = ctx.close_jar(&owner, owner_key).unwrap_err();
+    assert!(err.contains(ERR_VAULT_NOT_EMPTY), "unexpected error: {err}");
+    assert_eq!(ctx.token_balance(&ctx.vault), 500);
+    assert!(ctx.lamports(&ctx.jar) > 0);
+}
+
+#[test]
+fn stranger_cannot_close_jar() {
+    let mut ctx = setup();
+    ctx.initialize().unwrap();
+
+    let stranger = Keypair::new();
+    ctx.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
+    let (jar_lamports, vault_lamports) = (ctx.lamports(&ctx.jar), ctx.lamports(&ctx.vault));
+
+    // Stranger signs and tries to take the rent for themselves.
+    let stranger_key = stranger.pubkey();
+    let err = ctx.close_jar(&stranger, stranger_key).unwrap_err();
+    assert!(err.contains(ERR_UNAUTHORIZED), "unexpected error: {err}");
+
+    // Real owner's pubkey without its signature is rejected as well.
+    let owner_key = ctx.owner.pubkey();
+    let err = ctx.close_jar(&stranger, owner_key).unwrap_err();
+    assert!(err.contains("MissingRequiredSignature"), "unexpected error: {err}");
+
+    assert_eq!(ctx.lamports(&ctx.jar), jar_lamports);
+    assert_eq!(ctx.lamports(&ctx.vault), vault_lamports);
 }
